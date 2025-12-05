@@ -1,0 +1,627 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>WebAR GPU Particles + MediaPipe Hands + TF.js (100k+)</title>
+<style>
+  html,body { margin:0; height:100%; background:#000; overflow:hidden; color:#ddd; font-family: system-ui,Segoe UI,Roboto,'Noto Sans JP',sans-serif; }
+  #ui { position:fixed; left:8px; top:8px; z-index:20; background:rgba(0,0,0,0.45); padding:8px; border-radius:8px; max-width:320px; }
+  #ui h3 { margin:4px 0; font-size:14px; color:#9ff; }
+  #ui label{ display:block; font-size:12px; margin-top:6px; color:#ccc }
+  #video { position:fixed; right:8px; top:8px; width:220px; border-radius:8px; z-index:20; opacity:0.55; }
+  button, select, input { font-size:13px; padding:6px; margin-top:6px; width:100%; box-sizing:border-box; background:#111; color:#eee; border:1px solid #333; border-radius:6px; }
+  small { color:#8aa; }
+</style>
+</head>
+<body>
+
+<canvas id="three"></canvas>
+<video id="video" autoplay playsinline muted></video>
+
+<div id="ui">
+  <h3>WebAR GPU Particles — Modes & Controls</h3>
+  <label>Particles texture size (sqrt) — affects count</label>
+  <select id="texSize">
+    <option value="256">256 (65,536)</option>
+    <option value="320" selected>320 (102,400)</option>
+    <option value="384">384 (147,456)</option>
+    <option value="512">512 (262,144)</option>
+  </select>
+
+  <label>Visual Mode</label>
+  <select id="mode">
+    <option value="sphere">Hand Open → Sphere</option>
+    <option value="text">Scissor → "我是 Mok"</option>
+    <option value="ring">Fist → Ring</option>
+    <option value="star">Point → Star</option>
+    <option value="heart">Thumb → Heart</option>
+  </select>
+
+  <label>Dynamics</label>
+  <input id="viscosity" type="range" min="0" max="1" step="0.01" value="0.06" />
+  <small>Viscosity (higher = smoother)</small>
+
+  <label>Explosion strength</label>
+  <input id="explPow" type="range" min="0" max="10" step="0.1" value="3.0" />
+  <small>On gesture switch / manual explode</small>
+  <button id="explodeBtn">Trigger Explosion</button>
+
+  <label>Gesture Mode</label>
+  <select id="gestureMode">
+    <option value="heuristic" selected>Heuristic (fast)</option>
+    <option value="ml">ML Model (use/training)</option>
+  </select>
+
+  <h3 style="margin-top:10px">Gesture Trainer (TF.js)</h3>
+  <label>Current Label</label>
+  <select id="label">
+    <option value="open">open</option>
+    <option value="scissor">scissor</option>
+    <option value="fist">fist</option>
+    <option value="point">point</option>
+    <option value="thumb">thumb</option>
+  </select>
+  <button id="startRecord">Start Recording (5s)</button>
+  <button id="trainModel">Train Model</button>
+  <button id="saveModel">Save Model (browser storage)</button>
+  <button id="loadModel">Load Model</button>
+
+  <h3 style="margin-top:10px">Deploy</h3>
+  <small>To publish: put this file into a GitHub repo and enable Pages, or upload to Vercel/Netlify.</small>
+  <button id="deploySteps">Show Quick Deploy Steps</button>
+</div>
+
+<!-- Libraries (module) -->
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.158.0/examples/jsm/controls/OrbitControls.js';
+import { GPUComputationRenderer } from 'https://unpkg.com/three@0.158.0/examples/jsm/misc/GPUComputationRenderer.js';
+
+// MediaPipe (non-module) loaded below; TF.js also loaded below as global
+</script>
+
+<!-- Non-module libs -->
+<script src="https://unpkg.com/@mediapipe/hands/hands.js"></script>
+<script src="https://unpkg.com/@mediapipe/camera_utils/camera_utils.js"></script>
+<script src="https://unpkg.com/@mediapipe/drawing_utils/drawing_utils.js"></script>
+
+<script src="https://unpkg.com/@tensorflow/tfjs@4.11.0/dist/tf.min.js"></script>
+
+<!-- Main app (module) -->
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.158.0/examples/jsm/controls/OrbitControls.js';
+import { GPUComputationRenderer } from 'https://unpkg.com/three@0.158.0/examples/jsm/misc/GPUComputationRenderer.js';
+
+const canvas = document.getElementById('three');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.setClearColor(0x000000, 1);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, innerWidth/innerHeight, 0.1, 2000);
+camera.position.set(0,0,80);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enabled = false;
+
+// UI refs
+const texSizeEl = document.getElementById('texSize');
+const modeEl = document.getElementById('mode');
+const viscosityEl = document.getElementById('viscosity');
+const explodeBtn = document.getElementById('explodeBtn');
+const explPowEl = document.getElementById('explPow');
+const gestureModeEl = document.getElementById('gestureMode');
+const startRecordBtn = document.getElementById('startRecord');
+const trainModelBtn = document.getElementById('trainModel');
+const saveModelBtn = document.getElementById('saveModel');
+const loadModelBtn = document.getElementById('loadModel');
+const labelEl = document.getElementById('label');
+const deployStepsBtn = document.getElementById('deploySteps');
+
+// video + mediapipe setup
+const video = document.getElementById('video');
+let mediaStream = null;
+async function initCamera(){
+  mediaStream = await navigator.mediaDevices.getUserMedia({ video:{ width:640, height:480 }, audio:false });
+  video.srcObject = mediaStream;
+  await video.play();
+}
+await initCamera();
+
+// MediaPipe Hands
+const hands = new Hands({locateFile: (x)=>`https://unpkg.com/@mediapipe/hands/${x}`});
+hands.setOptions({ maxNumHands:1, modelComplexity:1, minDetectionConfidence:0.65, minTrackingConfidence:0.6 });
+let lastPalmX = null, lastTime = performance.now();
+let handState = null, palmArea = 0;
+hands.onResults(onHands);
+const cameraMp = new Camera(video, { onFrame: async ()=>{ await hands.send({image:video}); }, width:640, height:480 });
+cameraMp.start();
+
+// TensorFlow gesture model (simple MLP)
+let gestureModel = null;
+let trainingData = { xs:[], ys:[] };
+
+// Utility: convert MediaPipe landmarks -> normalized feature vector (21*3)
+function landmarksToVector(landmarks){
+  // landmarks are normalized [0..1] (x,y,z)
+  const v = [];
+  for(let i=0;i<21;i++){
+    const lm = landmarks[i];
+    v.push(lm.x, lm.y, lm.z);
+  }
+  return v;
+}
+
+// Heuristic detector (fallback)
+function heuristicDetect(lm){
+  // uses tip vs pip to detect finger open/close; thumb handled separately
+  const isTipUp = i => lm[i].y < lm[i-2].y;
+  const thumbLeft = lm[4].x < lm[3].x;
+  const open = isTipUp(8) && isTipUp(12) && isTipUp(16) && isTipUp(20);
+  const scissor = isTipUp(8) && isTipUp(12) && !isTipUp(16) && !isTipUp(20);
+  const fist = !isTipUp(8) && !isTipUp(12) && !isTipUp(16) && !isTipUp(20);
+  const point = isTipUp(8) && !isTipUp(12) && !isTipUp(16) && !isTipUp(20);
+  const thumb = thumbLeft && !isTipUp(8) && !isTipUp(12);
+  if(open) return 'open';
+  if(scissor) return 'scissor';
+  if(fist) return 'fist';
+  if(point) return 'point';
+  if(thumb) return 'thumb';
+  return null;
+}
+
+// ML predict wrapper
+async function predictML(lm){
+  if(!gestureModel) return null;
+  const vec = landmarksToVector(lm);
+  const input = tf.tensor2d([vec]);
+  const out = gestureModel.predict(input);
+  const arg = out.argMax(-1).dataSync()[0];
+  input.dispose(); out.dispose();
+  const labels = ['open','scissor','fist','point','thumb'];
+  return labels[arg];
+}
+
+// On hand results
+async function onHands(results){
+  if(!results.multiHandLandmarks || !results.multiHandLandmarks[0]) return;
+  const lm = results.multiHandLandmarks[0];
+  palmArea = Math.abs(lm[5].x - lm[17].x); // approximate area ~ depth
+  // compute hand speed
+  const now = performance.now();
+  const palmX = lm[0].x;
+  const dt = (now - lastTime)/1000;
+  const speedX = (lastPalmX === null) ? 0 : (palmX - lastPalmX)/Math.max(dt, 0.001);
+  lastPalmX = palmX; lastTime = now;
+  // pass wind impulse to GPU sim
+  uniforms.u_wind.value.set((palmX-0.5)*2, speedX*15.0, 0);
+  // depth scaling
+  uniforms.u_depthScale.value = THREE.MathUtils.clamp(1 + palmArea*4, 0.6, 3.0);
+
+  // detect gesture (mode selection)
+  let detected = null;
+  if(gestureModeEl.value==='ml'){
+    detected = await predictML(lm).catch(()=>null);
+  }
+  if(!detected) detected = heuristicDetect(lm);
+
+  if(detected && detected !== handState){
+    handState = detected;
+    // trigger mode mapping
+    const mapping = { open:'sphere', scissor:'text', fist:'ring', point:'star', thumb:'heart' };
+    if(mapping[detected]) {
+      modeEl.value = mapping[detected];
+      triggerShape(mapping[detected]);
+      explode(parseFloat(explPowEl.value));
+    }
+  }
+}
+
+// ----- GPU Computation setup -----
+let gpuCompute, posVar, velVar;
+let WIDTH = parseInt(texSizeEl.value);
+let PARTICLE_COUNT = WIDTH * WIDTH;
+
+const rendererPixelRatio = Math.min(window.devicePixelRatio, 2);
+renderer.setPixelRatio(rendererPixelRatio);
+
+// Uniforms shared
+const uniforms = {
+  u_time: { value:0 },
+  u_delta: { value: 0 },
+  u_wind: { value: new THREE.Vector3(0,0,0) },
+  u_explosion: { value: new THREE.Vector3(0,0,0) },
+  u_explPower: { value: 3.0 },
+  u_viscosity: { value: parseFloat(viscosityEl.value) },
+  u_depthScale: { value: 1.0 },
+  u_mode: { value: 0 }, // encoded mode
+  u_textSampler: { value: null }
+};
+
+// Initialize GPUComputationRenderer
+function initGPU(){
+  WIDTH = parseInt(texSizeEl.value);
+  PARTICLE_COUNT = WIDTH*WIDTH;
+  if(gpuCompute) { gpuCompute.dispose(); scene.remove(particlesMesh); }
+
+  gpuCompute = new GPUComputationRenderer(WIDTH, WIDTH, renderer);
+
+  const dtPos = gpuCompute.createTexture();
+  const dtVel = gpuCompute.createTexture();
+  fillTextures(dtPos, dtVel);
+
+  const posShader = positionFragmentShader();
+  const velShader = velocityFragmentShader();
+
+  posVar = gpuCompute.addVariable("texturePosition", posShader, dtPos);
+  velVar = gpuCompute.addVariable("textureVelocity", velShader, dtVel);
+  gpuCompute.setVariableDependencies(posVar, [posVar, velVar]);
+  gpuCompute.setVariableDependencies(velVar, [posVar, velVar]);
+
+  posVar.material.uniforms = uniforms;
+  velVar.material.uniforms = uniforms;
+
+  const error = gpuCompute.init();
+  if(error !== null) {
+    console.error("GPU Compute init error:", error);
+  }
+
+  // geometry & render mesh
+  const geometry = new THREE.BufferGeometry();
+  const positions = new Float32Array(PARTICLE_COUNT * 3);
+  const uvs = new Float32Array(PARTICLE_COUNT * 2);
+  let p = 0;
+  for(let i=0;i<WIDTH;i++){
+    for(let j=0;j<WIDTH;j++){
+      uvs[p*2] = i / (WIDTH-1);
+      uvs[p*2+1] = j / (WIDTH-1);
+      positions[p*3] = (i / WIDTH - 0.5) * WIDTH * 0.02;
+      positions[p*3+1] = (j / WIDTH - 0.5) * WIDTH * 0.02;
+      positions[p*3+2] = 0;
+      p++;
+    }
+  }
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+
+  const material = new THREE.ShaderMaterial({
+    transparent: true,
+    depthTest: true,
+    uniforms: {
+      u_positions: { value: null },
+      u_pointSize: { value: 1.5 * (512/WIDTH) },
+      u_color: { value: new THREE.Color(0x00ffff) },
+      u_depthScale: uniforms.u_depthScale
+    },
+    vertexShader: renderVertexShader(),
+    fragmentShader: renderFragmentShader(),
+    blending: THREE.AdditiveBlending
+  });
+
+  particlesMesh = new THREE.Points(geometry, material);
+  particlesMesh.frustumCulled = false;
+  scene.add(particlesMesh);
+}
+
+function fillTextures(texPos, texVel){
+  const posArr = texPos.image.data;
+  const velArr = texVel.image.data;
+  for(let k=0;k<posArr.length;k+=4){
+    // random sphere-ish distribution
+    const i = (k/4);
+    const rx = (Math.random()-0.5)*40;
+    const ry = (Math.random()-0.5)*40;
+    const rz = (Math.random()-0.5)*20;
+    posArr[k+0] = rx;
+    posArr[k+1] = ry;
+    posArr[k+2] = rz;
+    posArr[k+3] = 1.0;
+
+    velArr[k+0] = (Math.random()-0.5)*0.01;
+    velArr[k+1] = (Math.random()-0.5)*0.01;
+    velArr[k+2] = (Math.random()-0.5)*0.01;
+    velArr[k+3] = 1.0;
+  }
+}
+
+// Shaders (as functions returning strings) -------------------
+function velocityFragmentShader(){
+  return `
+  precision highp float;
+  uniform float u_time;
+  uniform float u_delta;
+  uniform vec3 u_wind;
+  uniform vec3 u_explosion;
+  uniform float u_explPower;
+  uniform float u_viscosity;
+
+  varying vec2 vUv;
+  uniform sampler2D texturePosition;
+  uniform sampler2D textureVelocity;
+
+  // classic 2D hash
+  float hash(vec2 p){
+    return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453123);
+  }
+
+  // 3D simple curl noise (built from fbm)
+  float noise(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    float n = dot(i, vec3(1.0,57.0,113.0));
+    float res = mix(mix(mix( hash(vec2(n+0.0, n+1.0)), hash(vec2(n+1.0, n+2.0)), f.x),
+                        mix( hash(vec2(n+2.0, n+3.0)), hash(vec2(n+3.0, n+4.0)), f.x), f.y),
+                    mix(mix( hash(vec2(n+4.0, n+5.0)), hash(vec2(n+5.0, n+6.0)), f.x),
+                        mix( hash(vec2(n+6.0, n+7.0)), hash(vec2(n+7.0, n+8.0)), f.x), f.y), f.z);
+    return res;
+  }
+
+  vec3 curlNoise(vec3 p){
+    float e = 0.1;
+    float n1 = noise(p + vec3(e,0,0));
+    float n2 = noise(p - vec3(e,0,0));
+    float n3 = noise(p + vec3(0,e,0));
+    float n4 = noise(p - vec3(0,e,0));
+    float n5 = noise(p + vec3(0,0,e));
+    float n6 = noise(p - vec3(0,0,e));
+    vec3 c = vec3(n4 - n3, n1 - n2, n6 - n5);
+    return normalize(c+0.0001);
+  }
+
+  void main() {
+    vec2 uv = vUv;
+    vec4 pos = texture2D(texturePosition, uv);
+    vec4 vel = texture2D(textureVelocity, uv);
+    vec3 p = pos.xyz;
+    vec3 v = vel.xyz;
+
+    // curl noise adds fluid-like swirling
+    vec3 c = curlNoise(p * 0.05 + u_time * 0.02);
+
+    // base acceleration from curl noise + wind
+    vec3 acc = c * 0.5 + u_wind * 0.003;
+
+    // explosion impulse (one-off spike)
+    acc += normalize(u_explosion) * u_explPower * exp(-length(p - u_explosion) * 0.15);
+
+    // viscosity / damping
+    v += acc * u_delta;
+    v *= (1.0 - u_viscosity);
+
+    // bounds (soft)
+    float bound = 200.0;
+    if(length(p) > bound){
+      v += -normalize(p) * 0.5;
+    }
+
+    gl_FragColor = vec4(v, 1.0);
+  }
+  `;
+}
+
+function positionFragmentShader(){
+  return `
+  precision highp float;
+  uniform float u_time;
+  uniform float u_delta;
+  uniform float u_depthScale;
+  uniform sampler2D texturePosition;
+  uniform sampler2D textureVelocity;
+  varying vec2 vUv;
+
+  void main(){
+    vec2 uv = vUv;
+    vec4 pos = texture2D(texturePosition, uv);
+    vec4 vel = texture2D(textureVelocity, uv);
+    vec3 p = pos.xyz;
+    vec3 v = vel.xyz;
+
+    p += v * u_delta * 60.0 * u_depthScale;
+
+    gl_FragColor = vec4(p, 1.0);
+  }
+  `;
+}
+
+function renderVertexShader(){
+  return `
+  precision highp float;
+  uniform sampler2D u_positions;
+  uniform float u_pointSize;
+  uniform float u_depthScale;
+  varying vec3 vColor;
+  varying float vDepth;
+
+  attribute vec2 uv;
+  void main(){
+    vec4 posTex = texture2D(u_positions, uv);
+    vec3 p = posTex.xyz * u_depthScale;
+    vec4 mvPosition = modelViewMatrix * vec4(p, 1.0);
+    gl_PointSize = u_pointSize * (300.0 / -mvPosition.z);
+    gl_Position = projectionMatrix * mvPosition;
+    vDepth = -mvPosition.z;
+    vColor = vec3(0.0, 1.0, 1.0) * (0.5 + clamp(vDepth/80.0, 0.0, 1.0));
+  }
+  `;
+}
+
+function renderFragmentShader(){
+  return `
+  precision highp float;
+  varying vec3 vColor;
+  varying float vDepth;
+  void main(){
+    float r = length(gl_PointCoord - 0.5);
+    float alpha = smoothstep(0.5, 0.45, r);
+    gl_FragColor = vec4(vColor, alpha);
+  }
+  `;
+}
+
+// initialize
+let particlesMesh = null;
+initGPU();
+
+// UI handlers
+texSizeEl.addEventListener('change', ()=>{ initGPU(); });
+viscosityEl.addEventListener('input', ()=> uniforms.u_viscosity.value = parseFloat(viscosityEl.value));
+explPowEl.addEventListener('input', ()=> uniforms.u_explPower.value = parseFloat(explPowEl.value));
+explodeBtn.addEventListener('click', ()=> explode(parseFloat(explPowEl.value)));
+deployStepsBtn.addEventListener('click', ()=>{
+  alert('Quick deploy:\n1) Create GitHub repo with this file as index.html\n2) In repo Settings > Pages enable GitHub Pages from main branch (root)\n3) OR drag & drop to Netlify/Vercel for instant deploy.');
+});
+
+// trigger shape generation by writing into pos texture (simple approach: set u_explosion to shape center and set special mode)
+// More advanced: upload an image -> generate text particle positions -> write into texture (omitted for brevity)
+function triggerShape(mode){
+  // mode mapping: sphere,text,ring,star,heart
+  // we'll use a quick CPU -> texture write: get current pos texture, modify values and set as variable initial
+  const dt = gpuCompute.createTexture();
+  const data = dt.image.data;
+  for(let k=0;k<data.length;k+=4){
+    const idx = k/4;
+    // map idx -> param
+    let x=0,y=0,z=0;
+    const t = (idx / PARTICLE_COUNT) * Math.PI * 2;
+    if(mode==='sphere'){
+      const r = Math.cbrt(Math.random())*25.0;
+      const theta = Math.random()*6.28318, phi=Math.acos(2*Math.random()-1);
+      x = r * sin(phi) * cos(theta);
+      y = r * sin(phi) * sin(theta);
+      z = r * cos(phi);
+    } else if(mode==='ring'){
+      const a = Math.random()*6.28318;
+      x = Math.cos(a)*28.0;
+      y = Math.sin(a)*28.0;
+      z = (Math.random()-0.5)*1.5;
+    } else if(mode==='star'){
+      const a = Math.random()*6.28318;
+      const R = (Math.random()>0.6)?28:8;
+      x = Math.cos(a)*R; y=Math.sin(a)*R; z=(Math.random()-0.5)*2.0;
+    } else if(mode==='heart'){
+      const a = Math.random()*6.28318;
+      x = 16.0 * pow(sin(a),3);
+      y = (13.0*cos(a)-5.0*cos(2.0*a)-2.0*cos(3.0*a)-cos(4.0*a));
+      x *= 1.2; y *= 1.2;
+      z = (Math.random()-0.5)*2.0;
+    } else if(mode==='text'){
+      // fallback: scatter towards plane (text specific generation would require canvas sampling)
+      x = (Math.random()-0.5)*40;
+      y = (Math.random()-0.5)*12;
+      z = (Math.random()-0.5)*1.0;
+    }
+    data[k+0] = x;
+    data[k+1] = y;
+    data[k+2] = z;
+    data[k+3] = 1.0;
+  }
+  // set as current position texture by forcing variable value (crude)
+  gpuCompute.renderTexture(dt, posVar.renderTargets[0]);
+}
+
+// Explosion helper (sets uniform one frame)
+function explode(strength=3.0){
+  // set random explosion center near camera axis
+  const ex = (Math.random()-0.5)*40;
+  const ey = (Math.random()-0.5)*40;
+  const ez = (Math.random()-0.5)*20;
+  uniforms.u_explosion.value.set(ex, ey, ez);
+  uniforms.u_explPower.value = strength;
+  // clear after short delay
+  setTimeout(()=> uniforms.u_explosion.value.set(0,0,0), 120);
+}
+
+// Animation loop
+let last = performance.now();
+function animate(){
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const dt = (now - last)/1000;
+  last = now;
+  uniforms.u_time.value = now * 0.001;
+  uniforms.u_delta.value = dt;
+
+  // compute step
+  gpuCompute.compute();
+
+  // update render material with latest pos texture
+  if(particlesMesh){
+    particlesMesh.material.uniforms.u_positions.value = gpuCompute.getCurrentRenderTarget(posVar).texture;
+    particlesMesh.material.uniforms.u_pointSize.value = 1.5 * (512/WIDTH);
+    particlesMesh.material.uniforms.u_depthScale.value = uniforms.u_depthScale.value;
+  }
+
+  renderer.render(scene, camera);
+}
+animate();
+
+// Gesture trainer: collect landmark vectors for label
+startRecordBtn.addEventListener('click', async ()=>{
+  const label = labelEl.value;
+  alert('Recording for 5 seconds. Make gesture repeatedly.');
+  trainingData.xs = trainingData.xs || [];
+  trainingData.ys = trainingData.ys || [];
+  const start = performance.now();
+  return new Promise((res)=>{
+    const handler = (results) => {
+      if(!results.multiHandLandmarks || !results.multiHandLandmarks[0]) return;
+      const vec = landmarksToVector(results.multiHandLandmarks[0]);
+      trainingData.xs.push(vec);
+      trainingData.ys.push(['open','scissor','fist','point','thumb'].indexOf(label));
+    };
+    hands.onResults(handler);
+    setTimeout(()=>{
+      hands.onResults(onHands); // restore
+      alert(`Recorded ${trainingData.xs.length} samples total.`);
+      res();
+    }, 5000);
+  });
+});
+
+trainModelBtn.addEventListener('click', async ()=>{
+  if(!trainingData.xs || trainingData.xs.length < 20){ alert('Not enough samples (min ~20).'); return; }
+  const xs = tf.tensor2d(trainingData.xs);
+  const ys = tf.tensor1d(trainingData.ys, 'int32');
+  const ysOne = tf.oneHot(ys, 5);
+  const model = tf.sequential();
+  model.add(tf.layers.dense({ units: 128, inputShape: [63], activation:'relu' }));
+  model.add(tf.layers.dropout({ rate:0.2 }));
+  model.add(tf.layers.dense({ units: 64, activation:'relu' }));
+  model.add(tf.layers.dense({ units: 5, activation:'softmax' }));
+  model.compile({ optimizer: tf.train.adam(0.001), loss: 'categoricalCrossentropy', metrics:['accuracy']});
+  await model.fit(xs, ysOne, { epochs: 30, batchSize: 32, callbacks: {
+    onEpochEnd: (e,logs) => console.log('epoch', e, logs.loss, logs.acc)
+  }});
+  gestureModel = model;
+  xs.dispose(); ys.dispose(); ysOne.dispose();
+  alert('Model trained and ready (in memory).');
+});
+
+saveModelBtn.addEventListener('click', async ()=>{
+  if(!gestureModel){ alert('No model to save'); return; }
+  await gestureModel.save('indexeddb://gesture-model-v1');
+  alert('Model saved to browser storage (IndexedDB).');
+});
+
+loadModelBtn.addEventListener('click', async ()=>{
+  try{
+    gestureModel = await tf.loadLayersModel('indexeddb://gesture-model-v1');
+    alert('Model loaded from browser storage.');
+  }catch(e){
+    alert('No saved model found.');
+  }
+});
+
+// Resize handling
+window.addEventListener('resize', ()=> {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+</script>
+
+</body>
+</html>
